@@ -160,19 +160,14 @@ impl PredictionHandler {
     fn clear_context(&mut self) {
         self.context.clear();
     }
-    fn predict_next_word(&self) -> String {
+    fn predict_next_word(&self, context: String) -> String {
         let system_prompt = &SYS_PREDICT_NEXT_WORD;
-        let context_string = self
-            .context
-            .iter()
-            .cloned()
-            .collect::<Vec<String>>()
-            .join(" ");
+        let combined_context = [vec![context], self.context.clone().into()].concat();
+        let context_string = combined_context.join(" ");
         let user_prompt = format!(
             "Given the following context, predict the single most likely next word:\n\n{}",
             context_string
         );
-        println!("User Prompt: {}", user_prompt);
         let prediction = RUNTIME.block_on(async {
             tokio::task::spawn_blocking(move || {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -195,22 +190,14 @@ impl PredictionHandler {
             .trim_matches(|c: char| !c.is_alphanumeric())
             .to_string()
     }
-    fn predict_next_sentence(&self) -> String {
+    fn predict_next_sentence(&self, context: String) -> String {
         let system_prompt = &SYS_PREDICT_NEXT_SENTENCE;
-        let context_string = self
-            .context
-            .iter()
-            .cloned()
-            .collect::<Vec<String>>()
-            .join(" ");
-
+        let combined_context = [vec![context], self.context.clone().into()].concat();
+        let context_string = combined_context.join(" ");
         let user_prompt = format!(
             "Given the following context, predict the most likely next sentence:\n\n{}",
             context_string
         );
-
-        println!("User Prompt: {}", user_prompt);
-
         let prediction = RUNTIME.block_on(async {
             tokio::task::spawn_blocking(move || {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -226,8 +213,6 @@ impl PredictionHandler {
             .await
             .expect("Task panicked")
         });
-
-        // Parse the prediction to ensure it's only one sentence
         parse_single_sentence(&prediction)
     }
 }
@@ -421,10 +406,7 @@ impl PhaeroPredict {
             current_word: String::new(),
             hotkeys: HashMap::new(),
         };
-        phaero_predict.hotkeys.insert(
-            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyI]),
-            Self::insert_text,
-        );
+
         phaero_predict.hotkeys.insert(
             KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyC]),
             Self::cancel_operation,
@@ -442,12 +424,24 @@ impl PhaeroPredict {
             Self::format_clipboard,
         );
         phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyI]),
+            Self::prompt_ollama_with_text,
+        );
+        phaero_predict.hotkeys.insert(
             KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyP]),
             Self::predict_next_sentence,
         );
         phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyW]),
+            Self::predict_next_word,
+        );
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyX]),
+            Self::clear_context,
+        );
+        phaero_predict.hotkeys.insert(
             KeyCombination::new(vec![Key::ControlLeft, Key::KeyC]),
-            Self::copy_into_context,
+            Self::do_nothing,
         );
         phaero_predict.hotkeys.insert(
             KeyCombination::new(vec![Key::ControlLeft, Key::KeyV]),
@@ -491,10 +485,8 @@ impl PhaeroPredict {
         }
     }
     fn do_nothing(&mut self) {}
-    fn copy_into_context(&mut self) {
-        let clipboard_content = self.clipboard_content.lock().unwrap().clone();
+    fn clear_context(&mut self) {
         self.prediction_handler.clear_context();
-        self.prediction_handler.add_word(clipboard_content);
     }
     fn explain_ollama(&mut self) {
         if !SHOULD_CONTINUE.load(Ordering::SeqCst) {
@@ -510,6 +502,28 @@ impl PhaeroPredict {
             RUNTIME.block_on(async {
                 tokio::task::spawn_blocking(move || {
                     ollama_call(system_prompt, user_prompt, None);
+                })
+                .await
+                .expect("Task panicked");
+            })
+        });
+    }
+    fn prompt_ollama_with_text(&mut self) {
+        let clipboard_content = self.clipboard_content.lock().unwrap().clone();
+        let system_prompt = "You are an AI assistant.";
+        let user_prompt = format!(
+            "Please do what's specified in the following text:\n\n{} using the text as context. Do not include any explanations or comments. Return only the updated text.",
+            clipboard_content
+        );
+        let clipboard_tx = Arc::new(self.clipboard_tx.clone());
+        let update_clipboard = Box::new(move |formatted_text| {
+            let clipboard_tx = Arc::clone(&clipboard_tx);
+            let _ = clipboard_tx.send(formatted_text);
+        });
+        thread::spawn(move || {
+            RUNTIME.block_on(async {
+                tokio::task::spawn_blocking(move || {
+                    ollama_call(&system_prompt, user_prompt, Some(update_clipboard));
                 })
                 .await
                 .expect("Task panicked");
@@ -550,22 +564,6 @@ impl PhaeroPredict {
                 }
             },
             _ => {}
-        }
-    }
-
-    fn insert_text(&mut self) {
-        while let Some(word) = RESPONSE_BUFFER.lock().unwrap().pop_front() {
-            println!("Inserting word: {}", word);
-            for ch in word.chars() {
-                if !SHOULD_CONTINUE.load(Ordering::SeqCst) {
-                    println!("Operation cancelled");
-                    return;
-                }
-                if let Some(&key) = CHAR_TO_KEY.get(&ch) {
-                    send(&EventType::KeyPress(key));
-                    send(&EventType::KeyRelease(key));
-                }
-            }
         }
     }
 
@@ -617,7 +615,10 @@ impl PhaeroPredict {
         });
     }
     fn predict_next_word(&mut self) {
-        let predicted_word = self.prediction_handler.predict_next_word();
+        let curr_clipboard_content = self.clipboard_content.lock().unwrap().clone();
+        let predicted_word = self
+            .prediction_handler
+            .predict_next_word(curr_clipboard_content);
         for ch in predicted_word.chars() {
             if let Some(&key) = CHAR_TO_KEY.get(&ch.to_lowercase().next().unwrap()) {
                 send(&EventType::KeyPress(key));
@@ -628,7 +629,10 @@ impl PhaeroPredict {
         send(&EventType::KeyRelease(Key::Space));
     }
     fn predict_next_sentence(&mut self) {
-        let predicted_sentence = self.prediction_handler.predict_next_sentence();
+        let curr_clipboard_content = self.clipboard_content.lock().unwrap().clone();
+        let predicted_sentence = self
+            .prediction_handler
+            .predict_next_sentence(curr_clipboard_content);
         for ch in predicted_sentence.chars() {
             if let Some(&key) = CHAR_TO_KEY.get(&ch.to_lowercase().next().unwrap()) {
                 send(&EventType::KeyPress(key));
@@ -656,8 +660,7 @@ impl PhaeroPredict {
         let default_x_pos = max_text_width + 20.0 + companion_size;
         let mut y_pos = 20.0;
         y_pos = self.draw_keybinds(default_x_pos, y_pos);
-        y_pos = self.draw_clipboard_content(default_x_pos, y_pos, 250.0);
-        self.draw_prediction_context(default_x_pos, y_pos, 250.0);
+        self.draw_scratchpad_content(default_x_pos, y_pos, 250.0);
     }
 
     fn draw_companion(&self, size: f32) {
@@ -712,8 +715,8 @@ impl PhaeroPredict {
         y_pos + 20.0
     }
 
-    fn draw_clipboard_content(&self, x_pos: f32, mut y_pos: f32, max_width: f32) -> f32 {
-        draw_text("Clipboard Content:", x_pos, y_pos, 30.0, GREEN);
+    fn draw_scratchpad_content(&self, x_pos: f32, mut y_pos: f32, max_width: f32) -> f32 {
+        draw_text("Scratchpad Content:", x_pos, y_pos, 30.0, GREEN);
         y_pos += 40.0;
         y_pos = self.draw_wrapped_text(
             &self.clipboard_content.lock().unwrap(),
@@ -723,28 +726,6 @@ impl PhaeroPredict {
             Color::new(0.9, 0.9, 0.95, 1.0),
         );
         y_pos + 60.0
-    }
-
-    fn draw_prediction_context(&self, x_pos: f32, mut y_pos: f32, max_width: f32) {
-        draw_text("Current Context for Prediction:", x_pos, y_pos, 30.0, BLUE);
-        y_pos += 40.0;
-        y_pos = self.draw_wrapped_text(
-            &self
-                .prediction_handler
-                .context
-                .iter()
-                .take(50)
-                .cloned()
-                .collect::<Vec<String>>()
-                .join(" "),
-            x_pos,
-            y_pos,
-            max_width,
-            Color::new(0.9, 0.9, 0.95, 1.0),
-        );
-        if !self.current_word.is_empty() {
-            draw_text(&self.current_word, x_pos, y_pos, 25.0, YELLOW);
-        }
     }
 
     fn draw_wrapped_text(
