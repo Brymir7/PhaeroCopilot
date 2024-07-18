@@ -161,15 +161,19 @@ fn format_clipboard(should_continue: Arc<AtomicBool>, clipboard_ops: ClipboardOp
     });
 }
 fn format_text_remove_explanations(text: &str) -> String {
-    // Define the prefix that you want to remove
-    let prefix = "Here's the formatted text:\n\n";
+    let prefixes = [
+        "Here's the formatted text:\n\n",
+        "Here is the formatted text:\n\n",
+        "Here is:\n\n",
+    ];
 
-    // Check if the text starts with the prefix
-    if let Some(stripped) = text.strip_prefix(prefix) {
-        stripped.to_string()
-    } else {
-        text.to_string() // If the prefix is not found, return the original text
+    for prefix in &prefixes {
+        if let Some(stripped) = text.strip_prefix(prefix) {
+            return stripped.to_string();
+        }
     }
+
+    text.to_string()
 }
 fn ollama_call(
     system_prompt: &'static str,
@@ -192,7 +196,6 @@ fn ollama_call(
                     send(&EventType::KeyPress(key));
                     send(&EventType::KeyRelease(key));
                 }
-                sleep(Duration::from_millis(200));
             }
             sleep(Duration::from_millis(500));
             while !current_text.is_empty() && loading_indicator_clone.load(Ordering::SeqCst) {
@@ -318,7 +321,7 @@ struct PhaeroPredict {
 }
 
 impl PhaeroPredict {
-    fn new() -> Arc<Mutex<Self>> {
+    fn new() -> PhaeroPredict {
         let (event_tx, event_rx) = channel();
         let (clipboard_tx, clipboard_rx) = channel();
 
@@ -333,16 +336,6 @@ impl PhaeroPredict {
 
         let mut clipboard = Clipboard::new().unwrap();
         let clipboard_content = Arc::new(Mutex::new(clipboard.get_text().unwrap_or_default()));
-
-        let phaero_predict = Arc::new(Mutex::new(PhaeroPredict {
-            last_keys: Vec::new(),
-            keyboard_event_rx: event_rx,
-            clipboard,
-            clipboard_content: Arc::clone(&clipboard_content),
-            clipboard_tx,
-            clipboard_rx,
-        }));
-
         let clipboard_content_clone = Arc::clone(&clipboard_content);
         thread::spawn(move || loop {
             if let Ok(mut clipboard) = Clipboard::new() {
@@ -356,7 +349,14 @@ impl PhaeroPredict {
             sleep(Duration::from_millis(100));
         });
 
-        phaero_predict
+        PhaeroPredict {
+            last_keys: Vec::new(),
+            keyboard_event_rx: event_rx,
+            clipboard,
+            clipboard_content: Arc::clone(&clipboard_content),
+            clipboard_tx,
+            clipboard_rx,
+        }
     }
 
     fn update(&mut self) {
@@ -403,6 +403,8 @@ impl PhaeroPredict {
 
                             sleep(Duration::from_millis(100));
                             self.last_keys.clear();
+                            let mut buffer = RESPONSE_BUFFER.lock().unwrap();
+                            buffer.clear();
                             thread::spawn(move || {
                                 function(should_continue, clipboard_ops);
                             });
@@ -468,11 +470,10 @@ impl PhaeroPredict {
 }
 #[macroquad::main("Keyboard Input Display")]
 async fn main() {
-    let phaero_predict = PhaeroPredict::new();
+    let mut phaero_predict = PhaeroPredict::new();
     loop {
-        let mut phaero_predict_guard = phaero_predict.lock().unwrap();
-        phaero_predict_guard.update();
-        phaero_predict_guard.draw();
+        phaero_predict.update();
+        phaero_predict.draw();
         next_frame().await;
     }
 }
