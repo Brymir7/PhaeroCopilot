@@ -3,6 +3,7 @@ use lazy_static::lazy_static;
 use macroquad::prelude::*;
 use rdev::{listen, simulate, Event, EventType, Key};
 use serde_json::Value;
+use std::cmp::max;
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Mutex;
@@ -14,14 +15,20 @@ use std::thread::{self, sleep};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 const MAX_DISPLAYED_KEYS: usize = 10;
-const MODEL_NAME: &str = "llama3";
+const MODEL_NAME: &str = "gemma2:27b";
 const MODEL_URL: &str = "http://127.0.0.1:11434/api/chat";
+static COMPANION_TEXTURE: Lazy<Texture2D> = Lazy::new(|| {
+    Texture2D::from_file_with_format(
+        include_bytes!("../images/PhaeroCompanion.png"),
+        Some(ImageFormat::Png),
+    )
+});
+const SYS_FORMAT_PROMPT: &str = "Format the following text neatly with proper indentation, line breaks, and punctuation. Do not include any explanations or comments. Only return the formatted text. Fix any spelling or grammatical errors.";
+const SYS_PREDICT_NEXT_WORD: &str = "You are an AI assistant specialized in predicting the next word in a sequence. Provide only the single most likely next word, with no additional explanation or punctuation.";
+const SYS_PREDICT_NEXT_SENTENCE: &str = "You are an AI assistant specialized in predicting the next sentence in a sequence. Provide only the most likely next sentence, with no additional explanation or punctuation.";
 use arboard::Clipboard;
 use once_cell::sync::Lazy;
-type ClipboardOps = (
-    Box<dyn Fn() -> String + Send + Sync>,
-    Box<dyn Fn(String) + Send + Sync>,
-);
+
 static RUNTIME: Lazy<Runtime> =
     Lazy::new(|| Runtime::new().expect("Failed to create Tokio runtime"));
 lazy_static! {
@@ -68,24 +75,45 @@ lazy_static! {
         m.insert('0', Key::Num0);
         m
     };
-    static ref HOTKEYS: HashMap<KeyCombination, fn(Arc<AtomicBool>, ClipboardOps)> = {
+    static ref KEY_TO_CHAR: HashMap<Key, char> = {
         let mut m = HashMap::new();
-        m.insert(
-            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyI]),
-            insert_text as fn(Arc<AtomicBool>, ClipboardOps),
-        );
-        m.insert(
-            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyC]),
-            cancel_operation as fn(Arc<AtomicBool>, ClipboardOps),
-        );
-        m.insert(
-            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyO]),
-            call_ollama as fn(Arc<AtomicBool>, ClipboardOps),
-        );
-        m.insert(
-            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyF]),
-            format_clipboard as fn(Arc<AtomicBool>, ClipboardOps),
-        );
+        m.insert(Key::KeyA, 'a');
+        m.insert(Key::KeyB, 'b');
+        m.insert(Key::KeyC, 'c');
+        m.insert(Key::KeyD, 'd');
+        m.insert(Key::KeyE, 'e');
+        m.insert(Key::KeyF, 'f');
+        m.insert(Key::KeyG, 'g');
+        m.insert(Key::KeyH, 'h');
+        m.insert(Key::KeyI, 'i');
+        m.insert(Key::KeyJ, 'j');
+        m.insert(Key::KeyK, 'k');
+        m.insert(Key::KeyL, 'l');
+        m.insert(Key::KeyM, 'm');
+        m.insert(Key::KeyN, 'n');
+        m.insert(Key::KeyO, 'o');
+        m.insert(Key::KeyP, 'p');
+        m.insert(Key::KeyQ, 'q');
+        m.insert(Key::KeyR, 'r');
+        m.insert(Key::KeyS, 's');
+        m.insert(Key::KeyT, 't');
+        m.insert(Key::KeyU, 'u');
+        m.insert(Key::KeyV, 'v');
+        m.insert(Key::KeyW, 'w');
+        m.insert(Key::KeyX, 'x');
+        m.insert(Key::KeyY, 'y');
+        m.insert(Key::KeyZ, 'z');
+        m.insert(Key::Space, ' ');
+        m.insert(Key::Num1, '1');
+        m.insert(Key::Num2, '2');
+        m.insert(Key::Num3, '3');
+        m.insert(Key::Num4, '4');
+        m.insert(Key::Num5, '5');
+        m.insert(Key::Num6, '6');
+        m.insert(Key::Num7, '7');
+        m.insert(Key::Num8, '8');
+        m.insert(Key::Num9, '9');
+        m.insert(Key::Num0, '0');
         m
     };
     static ref SHOULD_CONTINUE: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
@@ -110,6 +138,100 @@ impl KeyCombination {
         false
     }
 }
+struct PredictionHandler {
+    context: VecDeque<String>,
+    max_context_length: usize,
+}
+
+impl PredictionHandler {
+    fn new(max_context_length: usize) -> Self {
+        PredictionHandler {
+            context: VecDeque::new(),
+            max_context_length,
+        }
+    }
+
+    fn add_word(&mut self, word: String) {
+        self.context.push_back(word);
+        if self.context.len() > self.max_context_length {
+            self.context.pop_front();
+        }
+    }
+    fn clear_context(&mut self) {
+        self.context.clear();
+    }
+    fn predict_next_word(&self) -> String {
+        let system_prompt = &SYS_PREDICT_NEXT_WORD;
+        let context_string = self
+            .context
+            .iter()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(" ");
+        let user_prompt = format!(
+            "Given the following context, predict the single most likely next word:\n\n{}",
+            context_string
+        );
+        println!("User Prompt: {}", user_prompt);
+        let prediction = RUNTIME.block_on(async {
+            tokio::task::spawn_blocking(move || {
+                let (tx, rx) = std::sync::mpsc::channel();
+                ollama_call(
+                    system_prompt,
+                    user_prompt,
+                    Some(Box::new(move |response| {
+                        tx.send(response).unwrap();
+                    })),
+                );
+                rx.recv().unwrap_or_else(|_| "".to_string())
+            })
+            .await
+            .expect("Task panicked")
+        });
+        prediction
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_string()
+    }
+    fn predict_next_sentence(&self) -> String {
+        let system_prompt = &SYS_PREDICT_NEXT_SENTENCE;
+        let context_string = self
+            .context
+            .iter()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join(" ");
+
+        let user_prompt = format!(
+            "Given the following context, predict the most likely next sentence:\n\n{}",
+            context_string
+        );
+
+        println!("User Prompt: {}", user_prompt);
+
+        let prediction = RUNTIME.block_on(async {
+            tokio::task::spawn_blocking(move || {
+                let (tx, rx) = std::sync::mpsc::channel();
+                ollama_call(
+                    system_prompt,
+                    user_prompt,
+                    Some(Box::new(move |response| {
+                        tx.send(response).unwrap();
+                    })),
+                );
+                rx.recv().unwrap_or_else(|_| "".to_string())
+            })
+            .await
+            .expect("Task panicked")
+        });
+
+        // Parse the prediction to ensure it's only one sentence
+        parse_single_sentence(&prediction)
+    }
+}
+
 fn send(event_type: &EventType) {
     let delay = Duration::from_millis(20);
     match simulate(event_type) {
@@ -121,45 +243,6 @@ fn send(event_type: &EventType) {
     thread::sleep(delay);
 }
 
-fn cancel_operation(should_continue: Arc<AtomicBool>, _clipboard_ops: ClipboardOps) {
-    println!("Operation cancelled");
-    should_continue.store(false, Ordering::SeqCst);
-}
-
-fn insert_text(should_continue: Arc<AtomicBool>, _clipboard_ops: ClipboardOps) {
-    while let Some(word) = RESPONSE_BUFFER.lock().unwrap().pop_front() {
-        println!("Inserting word: {}", word);
-        for ch in word.chars() {
-            if !should_continue.load(Ordering::SeqCst) {
-                println!("Operation cancelled");
-                return;
-            }
-            if let Some(&key) = CHAR_TO_KEY.get(&ch) {
-                send(&EventType::KeyPress(key));
-                send(&EventType::KeyRelease(key));
-            }
-        }
-    }
-}
-fn format_clipboard(should_continue: Arc<AtomicBool>, clipboard_ops: ClipboardOps) {
-    if !should_continue.load(Ordering::SeqCst) {
-        println!("Operation cancelled");
-        return;
-    }
-    let system_prompt = "Format the following text neatly with proper indentation, line breaks, and punctuation. Do not include any explanations or comments. Only return the formatted text. Fix any spelling or grammatical errors.";
-    let (read_clipboard, update_clipboard) = clipboard_ops;
-    let content = read_clipboard();
-
-    thread::spawn(move || {
-        RUNTIME.block_on(async {
-            tokio::task::spawn_blocking(move || {
-                ollama_call(system_prompt, content, Some(update_clipboard));
-            })
-            .await
-            .expect("Task panicked");
-        })
-    });
-}
 fn format_text_remove_explanations(text: &str) -> String {
     let prefixes = [
         "Here's the formatted text:\n\n",
@@ -175,42 +258,34 @@ fn format_text_remove_explanations(text: &str) -> String {
 
     text.to_string()
 }
+fn parse_single_sentence(text: &str) -> String {
+    let sentence_end_chars = ['.', '!', '?'];
+    let mut result = String::new();
+    let mut found_end = false;
+
+    for c in text.chars() {
+        if found_end {
+            if c.is_whitespace() {
+                result.push(c);
+            } else {
+                break;
+            }
+        } else {
+            result.push(c);
+            if sentence_end_chars.contains(&c) {
+                found_end = true;
+            }
+        }
+    }
+
+    result.trim().to_string()
+}
 fn ollama_call(
     system_prompt: &'static str,
     user_prompt: String,
     update_clipboard: Option<Box<dyn Fn(String) + Send + Sync>>,
 ) {
     println!("Starting ollama_call function");
-    let loading_indicator = Arc::new(AtomicBool::new(true));
-    let loading_indicator_clone = Arc::clone(&loading_indicator);
-    thread::spawn(move || {
-        let loading_text = "Loading...";
-        let mut current_text = String::new();
-        while loading_indicator_clone.load(Ordering::SeqCst) {
-            for ch in loading_text.chars() {
-                if !loading_indicator_clone.load(Ordering::SeqCst) {
-                    break;
-                }
-                current_text.push(ch);
-                if let Some(&key) = CHAR_TO_KEY.get(&ch) {
-                    send(&EventType::KeyPress(key));
-                    send(&EventType::KeyRelease(key));
-                }
-            }
-            sleep(Duration::from_millis(500));
-            while !current_text.is_empty() && loading_indicator_clone.load(Ordering::SeqCst) {
-                send(&EventType::KeyPress(Key::Backspace));
-                send(&EventType::KeyRelease(Key::Backspace));
-                current_text.pop();
-            }
-            sleep(Duration::from_millis(300));
-        }
-        for _ in 0..current_text.len() {
-            send(&EventType::KeyPress(Key::Backspace));
-            send(&EventType::KeyRelease(Key::Backspace));
-        }
-    });
-
     let future = async move {
         println!("Creating HTTP client");
         let client = reqwest::Client::builder()
@@ -218,7 +293,6 @@ fn ollama_call(
             .build();
         if let Err(e) = client {
             eprintln!("Failed to create client: {:?}", e);
-            loading_indicator.store(false, Ordering::SeqCst);
             return;
         }
         let client = client.unwrap();
@@ -247,6 +321,10 @@ fn ollama_call(
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(bytes) => {
+                            if !SHOULD_CONTINUE.load(Ordering::SeqCst) {
+                                println!("Operation cancelled");
+                                return;
+                            }
                             if let Ok(text) = String::from_utf8(bytes.to_vec()) {
                                 println!("Received data: {}", text);
                                 if let Ok(json) = serde_json::from_str::<Value>(&text) {
@@ -286,29 +364,9 @@ fn ollama_call(
             }
         }
         println!("ollama_call function completed");
-        loading_indicator.store(false, Ordering::SeqCst);
     };
 
     RUNTIME.spawn(future);
-}
-
-fn call_ollama(should_continue: Arc<AtomicBool>, clipboard_ops: ClipboardOps) {
-    let (read_clipboard, _) = clipboard_ops;
-    if !should_continue.load(Ordering::SeqCst) {
-        println!("Operation cancelled");
-        return;
-    }
-    let system_prompt = "You are a helpful AI assistant.";
-    let clipboard_content = read_clipboard();
-    thread::spawn(move || {
-        RUNTIME.block_on(async {
-            tokio::task::spawn_blocking(move || {
-                ollama_call(system_prompt, clipboard_content, None);
-            })
-            .await
-            .expect("Task panicked");
-        })
-    });
 }
 
 struct PhaeroPredict {
@@ -318,6 +376,9 @@ struct PhaeroPredict {
     clipboard_content: Arc<Mutex<String>>,
     clipboard_tx: Sender<String>,
     clipboard_rx: Receiver<String>,
+    prediction_handler: PredictionHandler,
+    current_word: String,
+    hotkeys: HashMap<KeyCombination, fn(&mut Self)>,
 }
 
 impl PhaeroPredict {
@@ -349,14 +410,54 @@ impl PhaeroPredict {
             sleep(Duration::from_millis(100));
         });
 
-        PhaeroPredict {
+        let mut phaero_predict = PhaeroPredict {
             last_keys: Vec::new(),
             keyboard_event_rx: event_rx,
             clipboard,
             clipboard_content: Arc::clone(&clipboard_content),
             clipboard_tx,
             clipboard_rx,
-        }
+            prediction_handler: PredictionHandler::new(50),
+            current_word: String::new(),
+            hotkeys: HashMap::new(),
+        };
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyI]),
+            Self::insert_text,
+        );
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyC]),
+            Self::cancel_operation,
+        );
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyO]),
+            Self::explain_ollama,
+        );
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyA]),
+            Self::answer_question,
+        );
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyF]),
+            Self::format_clipboard,
+        );
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::Alt, Key::KeyP]),
+            Self::predict_next_sentence,
+        );
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::KeyC]),
+            Self::copy_into_context,
+        );
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::KeyV]),
+            Self::do_nothing,
+        );
+        phaero_predict.hotkeys.insert(
+            KeyCombination::new(vec![Key::ControlLeft, Key::KeyS]),
+            Self::do_nothing,
+        );
+        phaero_predict
     }
 
     fn update(&mut self) {
@@ -380,36 +481,7 @@ impl PhaeroPredict {
                         self.last_keys.remove(0);
                     }
                     SHOULD_CONTINUE.store(true, Ordering::SeqCst);
-
-                    for (hotkey, function) in HOTKEYS.iter() {
-                        if hotkey.is_triggered(&event, &self.last_keys) {
-                            let should_continue = Arc::clone(&SHOULD_CONTINUE);
-                            let clipboard_content = Arc::clone(&self.clipboard_content);
-                            let read_clipboard =
-                                Box::new(move || clipboard_content.lock().unwrap().clone())
-                                    as Box<dyn Fn() -> String + Send + Sync>;
-
-                            let clipboard_tx = Arc::new(self.clipboard_tx.clone());
-
-                            let update_clipboard = {
-                                let clipboard_tx = Arc::clone(&clipboard_tx);
-                                Box::new(move |content: String| {
-                                    let _ = clipboard_tx.send(content.clone());
-                                })
-                                    as Box<dyn Fn(String) + Send + Sync>
-                            };
-
-                            let clipboard_ops = (read_clipboard, update_clipboard);
-
-                            sleep(Duration::from_millis(100));
-                            self.last_keys.clear();
-                            let mut buffer = RESPONSE_BUFFER.lock().unwrap();
-                            buffer.clear();
-                            thread::spawn(move || {
-                                function(should_continue, clipboard_ops);
-                            });
-                        }
-                    }
+                    self.handle_key_press(&event);
                 }
                 EventType::KeyRelease(key) => {
                     self.last_keys.retain(|&k| k != key);
@@ -418,57 +490,292 @@ impl PhaeroPredict {
             }
         }
     }
-
-    fn draw(&self) {
-        clear_background(BLACK);
-
-        // Draw last keys
-        for (i, key) in self.last_keys.iter().enumerate() {
-            let text = format!("Key: {:?}", key);
-            draw_text(&text, 20.0, 40.0 + i as f32 * 30.0, 30.0, WHITE);
+    fn do_nothing(&mut self) {}
+    fn copy_into_context(&mut self) {
+        let clipboard_content = self.clipboard_content.lock().unwrap().clone();
+        self.prediction_handler.clear_context();
+        self.prediction_handler.add_word(clipboard_content);
+    }
+    fn explain_ollama(&mut self) {
+        if !SHOULD_CONTINUE.load(Ordering::SeqCst) {
+            println!("Operation cancelled");
+            return;
+        }
+        let system_prompt = "You are a helpful AI assistant.";
+        let user_prompt_base =
+        "Please explain the following text in a clear and concise manner. Only return the explanation.";
+        let clipboard_content = self.clipboard_content.lock().unwrap().clone();
+        let user_prompt = format!("{} {}", user_prompt_base, clipboard_content);
+        thread::spawn(move || {
+            RUNTIME.block_on(async {
+                tokio::task::spawn_blocking(move || {
+                    ollama_call(system_prompt, user_prompt, None);
+                })
+                .await
+                .expect("Task panicked");
+            })
+        });
+    }
+    fn handle_key_press(&mut self, event: &Event) {
+        for (hotkey, function) in self.hotkeys.iter() {
+            if hotkey.is_triggered(event, &self.last_keys) {
+                SHOULD_CONTINUE.store(true, Ordering::SeqCst);
+                sleep(Duration::from_millis(100));
+                self.last_keys.clear();
+                RESPONSE_BUFFER.lock().unwrap().clear();
+                function(self);
+                return;
+            }
         }
 
-        // Draw response buffer and clipboard content
-        let mut y_pos_text = 50.0 + self.last_keys.len() as f32 * 30.0;
-        let mut x_pos_text = 20.0;
-        let mut y_pos_offset = 0.0;
-        const MAX_WIDTH: f32 = 500.0;
-
-        draw_text("Response Buffer:", 20.0, y_pos_text, 30.0, YELLOW);
-        y_pos_text += 40.0;
-
-        for word in RESPONSE_BUFFER.lock().unwrap().iter() {
-            if x_pos_text > MAX_WIDTH {
-                x_pos_text = 20.0;
-                y_pos_offset += 45.0;
-            }
-            draw_text(word, x_pos_text, y_pos_text + y_pos_offset, 30.0, WHITE);
-            x_pos_text += word.len() as f32 * 15.0;
-        }
-
-        y_pos_text += y_pos_offset + 60.0;
-        x_pos_text = 20.0;
-        y_pos_offset = 0.0;
-
-        draw_text("Clipboard Content:", 20.0, y_pos_text, 30.0, GREEN);
-        y_pos_text += 40.0;
-
-        for content in self
-            .clipboard_content
-            .lock()
-            .unwrap()
-            .split_ascii_whitespace()
-        {
-            if x_pos_text > MAX_WIDTH {
-                x_pos_text = 20.0;
-                y_pos_offset += 45.0;
-            }
-            draw_text(content, x_pos_text, y_pos_text + y_pos_offset, 30.0, WHITE);
-            x_pos_text += content.len() as f32 * 15.0;
+        match event.event_type {
+            EventType::KeyPress(key) => match key {
+                Key::Backspace => {
+                    if !self.current_word.is_empty() {
+                        self.current_word.pop();
+                    } else {
+                        if let Some(word) = self.prediction_handler.context.pop_back() {
+                            self.current_word = word;
+                        }
+                    }
+                }
+                Key::Space => {
+                    self.prediction_handler.add_word(self.current_word.clone());
+                    self.current_word.clear();
+                }
+                _ => {
+                    if let Some(ch) = KEY_TO_CHAR.get(&key) {
+                        self.current_word.push(*ch);
+                    }
+                }
+            },
+            _ => {}
         }
     }
+
+    fn insert_text(&mut self) {
+        while let Some(word) = RESPONSE_BUFFER.lock().unwrap().pop_front() {
+            println!("Inserting word: {}", word);
+            for ch in word.chars() {
+                if !SHOULD_CONTINUE.load(Ordering::SeqCst) {
+                    println!("Operation cancelled");
+                    return;
+                }
+                if let Some(&key) = CHAR_TO_KEY.get(&ch) {
+                    send(&EventType::KeyPress(key));
+                    send(&EventType::KeyRelease(key));
+                }
+            }
+        }
+    }
+
+    fn cancel_operation(&mut self) {
+        println!("Operation cancelled");
+        SHOULD_CONTINUE.store(false, Ordering::SeqCst);
+    }
+
+    fn format_clipboard(&mut self) {
+        if !SHOULD_CONTINUE.load(Ordering::SeqCst) {
+            println!("Operation cancelled");
+            return;
+        }
+        let system_prompt = SYS_FORMAT_PROMPT;
+        let content = self.clipboard_content.lock().unwrap().clone();
+        let clipboard_tx = Arc::new(self.clipboard_tx.clone());
+        let update_clipboard = Box::new(move |formatted_text| {
+            let clipboard_tx = Arc::clone(&clipboard_tx);
+            let _ = clipboard_tx.send(formatted_text);
+        });
+        thread::spawn(move || {
+            RUNTIME.block_on(async {
+                tokio::task::spawn_blocking(move || {
+                    ollama_call(system_prompt, content, Some(update_clipboard));
+                })
+                .await
+                .expect("Task panicked");
+            })
+        });
+    }
+    fn answer_question(&mut self) {
+        let system_prompt = "You are an AI assistant specialized in answering questions.";
+        let user_prompt = "Please answer the following question: ";
+        let clipboard_content = self.clipboard_content.lock().unwrap().clone();
+        let user_prompt = format!("{} {}", user_prompt, clipboard_content);
+        let clipboard_tx = Arc::new(self.clipboard_tx.clone());
+        let update_clipboard = Box::new(move |formatted_text| {
+            let clipboard_tx = Arc::clone(&clipboard_tx);
+            let _ = clipboard_tx.send(formatted_text);
+        });
+        thread::spawn(move || {
+            RUNTIME.block_on(async {
+                tokio::task::spawn_blocking(move || {
+                    ollama_call(system_prompt, user_prompt, Some(update_clipboard));
+                })
+                .await
+                .expect("Task panicked");
+            })
+        });
+    }
+    fn predict_next_word(&mut self) {
+        let predicted_word = self.prediction_handler.predict_next_word();
+        for ch in predicted_word.chars() {
+            if let Some(&key) = CHAR_TO_KEY.get(&ch.to_lowercase().next().unwrap()) {
+                send(&EventType::KeyPress(key));
+                send(&EventType::KeyRelease(key));
+            }
+        }
+        send(&EventType::KeyPress(Key::Space));
+        send(&EventType::KeyRelease(Key::Space));
+    }
+    fn predict_next_sentence(&mut self) {
+        let predicted_sentence = self.prediction_handler.predict_next_sentence();
+        for ch in predicted_sentence.chars() {
+            if let Some(&key) = CHAR_TO_KEY.get(&ch.to_lowercase().next().unwrap()) {
+                send(&EventType::KeyPress(key));
+                send(&EventType::KeyRelease(key));
+            }
+        }
+        send(&EventType::KeyPress(Key::Space));
+        send(&EventType::KeyRelease(Key::Space));
+    }
+    fn draw(&self) {
+        clear_background(Color::new(0.05, 0.05, 0.1, 1.0)); // Dark blue background
+
+        let companion_size = 150.0;
+        let max_text_width = max(
+            measure_text("Hey I'm Phaero", None, 20, 1.0).width as i32,
+            measure_text(
+                "I'm here to help you with your text based tasks!",
+                None,
+                20,
+                1.0,
+            )
+            .width as i32,
+        ) as f32;
+        self.draw_companion(companion_size);
+        let default_x_pos = max_text_width + 20.0 + companion_size;
+        let mut y_pos = 20.0;
+        y_pos = self.draw_keybinds(default_x_pos, y_pos);
+        y_pos = self.draw_clipboard_content(default_x_pos, y_pos, 250.0);
+        self.draw_prediction_context(default_x_pos, y_pos, 250.0);
+    }
+
+    fn draw_companion(&self, size: f32) {
+        draw_texture_ex(
+            &COMPANION_TEXTURE,
+            20.0,
+            (screen_height() / 2.0) - size,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(Vec2::new(size, size)),
+                ..Default::default()
+            },
+        );
+        const MESSAGE1: &str = "Hello! I'm your PhaeroPredict assistant.";
+        const MESSAGE2: &str = "I can help you with text formatting and word prediction.";
+        let max_text_width: f32 = max(
+            measure_text(MESSAGE1, None, 20, 1.0).width as i32,
+            measure_text(MESSAGE2, None, 20, 1.0).width as i32,
+        ) as f32;
+        let y_pos = screen_height() / 2.0 + 20.0;
+        draw_text(MESSAGE1, 20.0, y_pos, 20.0, PINK);
+        draw_text(MESSAGE2, 20.0, y_pos + 20.0, 20.0, PINK);
+        draw_text("My Response:", 20.0, y_pos + 50.0, 30.0, YELLOW);
+        self.draw_response(y_pos + 75.0, max_text_width);
+    }
+    fn draw_response(&self, mut y_pos: f32, max_width: f32) {
+        let text_color = Color::new(0.9, 0.9, 0.95, 1.0);
+        let mut x_pos = 20.0;
+        for word in RESPONSE_BUFFER.lock().unwrap().iter() {
+            if x_pos > max_width {
+                x_pos = 20.0;
+                y_pos += 35.0;
+            }
+            draw_text(word, x_pos, y_pos, 25.0, text_color);
+            x_pos += word.len() as f32 * 13.0;
+        }
+    }
+
+    fn draw_keybinds(&self, x_pos: f32, mut y_pos: f32) -> f32 {
+        draw_text("Keybinds:", x_pos, y_pos, 30.0, PURPLE);
+        y_pos += 40.0;
+        let keybinds = [
+            "Ctrl+Alt+I: Insert Text",
+            "Ctrl+Alt+C: Cancel Operation",
+            "Ctrl+Alt+F: Format Clipboard",
+            "Ctrl+Alt+P: Predict Next Word",
+        ];
+        for keybind in &keybinds {
+            draw_text(keybind, x_pos, y_pos, 20.0, SKYBLUE);
+            y_pos += 25.0;
+        }
+        y_pos + 20.0
+    }
+
+    fn draw_clipboard_content(&self, x_pos: f32, mut y_pos: f32, max_width: f32) -> f32 {
+        draw_text("Clipboard Content:", x_pos, y_pos, 30.0, GREEN);
+        y_pos += 40.0;
+        y_pos = self.draw_wrapped_text(
+            &self.clipboard_content.lock().unwrap(),
+            x_pos,
+            y_pos,
+            max_width,
+            Color::new(0.9, 0.9, 0.95, 1.0),
+        );
+        y_pos + 60.0
+    }
+
+    fn draw_prediction_context(&self, x_pos: f32, mut y_pos: f32, max_width: f32) {
+        draw_text("Current Context for Prediction:", x_pos, y_pos, 30.0, BLUE);
+        y_pos += 40.0;
+        y_pos = self.draw_wrapped_text(
+            &self
+                .prediction_handler
+                .context
+                .iter()
+                .take(50)
+                .cloned()
+                .collect::<Vec<String>>()
+                .join(" "),
+            x_pos,
+            y_pos,
+            max_width,
+            Color::new(0.9, 0.9, 0.95, 1.0),
+        );
+        if !self.current_word.is_empty() {
+            draw_text(&self.current_word, x_pos, y_pos, 25.0, YELLOW);
+        }
+    }
+
+    fn draw_wrapped_text(
+        &self,
+        text: &str,
+        mut x_pos: f32,
+        mut y_pos: f32,
+        max_width: f32,
+        color: Color,
+    ) -> f32 {
+        let starting_x: f32 = x_pos;
+        let mut words = text.split_whitespace();
+        let mut current_line = String::new();
+        while let Some(word) = words.next() {
+            let word_width = measure_text(word, None, 20, 1.0).width as f32;
+            if x_pos + word_width > (max_width + starting_x) {
+                draw_text(&current_line, starting_x, y_pos, 20.0, color);
+                y_pos += 25.0;
+                x_pos = starting_x;
+                current_line.clear();
+            }
+            current_line.push_str(word);
+            current_line.push(' ');
+            x_pos += word_width;
+        }
+        draw_text(&current_line, x_pos, y_pos, 20.0, color);
+        y_pos + 25.0
+    }
 }
-#[macroquad::main("Keyboard Input Display")]
+
+#[macroquad::main("PhaeroCopilot")]
 async fn main() {
     let mut phaero_predict = PhaeroPredict::new();
     loop {
